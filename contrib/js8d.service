@@ -1,0 +1,21 @@
+[Unit]
+Description=JS8 transmit daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/js8d
+EnvironmentFile=%h/.config/js8d/env
+Environment=JS8_SOCK=%t/js8d/control.sock
+RuntimeDirectory=js8d
+RuntimeDirectoryMode=0700
+UMask=0077
+StandardInput=null
+StandardOutput=null
+StandardError=journal
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

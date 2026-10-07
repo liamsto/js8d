@@ -1,0 +1,17 @@
+[package]
+name = "js8d"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alsa = "0.11"
+libc = "0.2"
+js8rs = { git = "https://github.com/liamsto/js8rs", rev = "6be4b5c4be8ec786fef5135debaa8e44be002444" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["k3"]
+k3 = []
+k4 = []
+experimental-time = ["js8rs/experimental-time"]
