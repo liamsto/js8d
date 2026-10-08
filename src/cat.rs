@@ -93,6 +93,7 @@ impl Cat {
         let mut out = cmd.as_bytes();
         let mut buf = [0u8; 128];
         let mut len = 0;
+        let mut last_tq = None;
         while Instant::now() < end {
             if !out.is_empty() {
                 if !poll(self.fd.as_raw_fd(), libc::POLLOUT, 100)? {
@@ -136,6 +137,12 @@ impl Cat {
                 if rsp == want {
                     return Ok(());
                 }
+                if want.starts_with(b"TQ") && matches!(rsp, b"TQ0;" | b"TQ1;") {
+                    last_tq = Some(rsp[2] as char);
+                    // RX/TX may still be settling and AI0 won't send an update, so wait a bit before checking, otherwise we'll get the wrong report
+                    std::thread::sleep(Duration::from_millis(100));
+                    out = TQ.as_bytes();
+                }
                 buf.copy_within(pos + 1..len, 0);
                 len -= pos + 1;
             }
@@ -144,8 +151,11 @@ impl Cat {
             }
         }
         Err(format!(
-            "CAT readback timed out, wanted {}",
-            String::from_utf8_lossy(want)
+            "CAT readback timed out, wanted {}{}",
+            String::from_utf8_lossy(want),
+            last_tq
+                .map(|v| format!(", last TQ{v};"))
+                .unwrap_or_default()
         )
         .into())
     }
@@ -163,7 +173,7 @@ impl Cat {
         #[cfg(not(feature = "k3"))]
         let cmd = format!("{freq}FA;");
         self.xchg(&cmd, freq.as_bytes())?;
-        // Band changes restore per-band settings: apply these AFTER setting FA.
+        // Band changes restore per-band settings so apply these AFTER setting FA.
         #[cfg(feature = "k3")]
         self.xchg("FR0;FT;", b"FT0;")?;
         #[cfg(not(feature = "k3"))]
@@ -171,7 +181,7 @@ impl Cat {
         // Enter DATA before DT, then force normal sideband for the chosen submode.
         self.xchg("MD6;DT0;MD6;MD;", b"MD6;")?;
         self.xchg("DT;", b"DT0;")?;
-        // G5 p5: mode changes can apply a CW VFO offset. Set frequency again.
+        // Mode changes can apply a CW VFO offset, reset freq
         self.xchg(&cmd, freq.as_bytes())?;
         self.xchg("RT0;RT;", b"RT0;")?;
         self.xchg("XT0;XT;", b"XT0;")?;
