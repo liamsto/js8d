@@ -1,7 +1,8 @@
 use crate::{Res, STOP, poll};
 use js8rs::{
     Submode,
-    codec::{BuildFramesOptions, EncodedFrame, build_frames},
+    codec::{BuildFramesOptions, EncodedFrame, build_frames, parse_frame},
+    command::parse_command,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,6 +29,9 @@ enum Req {
         dial_hz: u64,
         audio_hz: f64,
         message: String,
+        call: Option<String>,
+        #[serde(default)]
+        grid: String,
     },
 }
 
@@ -62,7 +66,14 @@ pub fn reply(peer: &mut UnixStream, rsp: Reply<'_>) -> Res<()> {
     Ok(())
 }
 
-fn encode(mode: &str, dial: u64, hz: f64, msg: &str) -> Res<(Submode, Vec<EncodedFrame>)> {
+fn encode(
+    mode: &str,
+    dial: u64,
+    hz: f64,
+    msg: &str,
+    call: Option<&str>,
+    grid: &str,
+) -> Res<(Submode, Vec<EncodedFrame>)> {
     let mode = match mode {
         "normal" | "n" => Submode::Normal,
         "fast" | "f" => Submode::Fast,
@@ -85,16 +96,49 @@ fn encode(mode: &str, dial: u64, hz: f64, msg: &str) -> Res<(Submode, Vec<Encode
         return Err("empty message".into());
     }
     let opts = BuildFramesOptions::new(msg, mode).with_data(true);
-    let frames = build_frames(&opts).encode()?;
-    if frames.is_empty() {
+    let mut raw = build_frames(&opts);
+    if raw.frames.is_empty() {
         return Err("empty encoding".into());
     }
-    // js8rs can drop unsupported characters so just leave it
-    let text: String = frames.iter().map(|f| f.decode().message).collect();
+    // Check text before framing adds headers and checksums.
+    let text: String = raw
+        .frames
+        .iter()
+        .map(|f| parse_frame(&f.encoded, f.flags, mode).message)
+        .collect();
     if text.trim_end() != msg.to_ascii_uppercase() {
         return Err("message cannot be encoded losslessly as JS8 text".into());
     }
-    Ok((mode, frames))
+    if let Some(call) = call {
+        let call = call.to_ascii_uppercase();
+        let grid = grid.to_ascii_uppercase();
+        // Reuse the sender parser for callsign syntax.
+        let id = format!("{call}: CQ");
+        if !parse_command(&id, None).is_some_and(|p| p.sender == Some(call.as_str())) {
+            return Err("bad station call".into());
+        }
+        if !grid.is_empty()
+            && !matches!(
+                grid.as_bytes(),
+                [b'A'..=b'R', b'A'..=b'R', b'0'..=b'9', b'0'..=b'9']
+            )
+        {
+            return Err("grid must be four chars, e.g. CN89".into());
+        }
+        let id = build_frames(&BuildFramesOptions::new("HB", mode).with_station(&call, &grid));
+        if id.frames.len() != 1
+            || parse_frame(&id.frames[0].encoded, id.frames[0].flags, mode).compound != call
+        {
+            return Err("station call cannot be encoded losslessly".into());
+        }
+        raw = build_frames(&opts.with_station(call, grid).with_data(false));
+    } else if !grid.is_empty() {
+        return Err("grid requires call".into());
+    }
+    if raw.frames.is_empty() {
+        return Err("empty encoding".into());
+    }
+    Ok((mode, raw.encode()?))
 }
 
 fn submit(peer: &mut Peer, len: usize, jobs: &Mutex<VecDeque<Job>>) -> Res<()> {
@@ -105,8 +149,11 @@ fn submit(peer: &mut Peer, len: usize, jobs: &Mutex<VecDeque<Job>>) -> Res<()> {
             dial_hz,
             audio_hz,
             message,
+            call,
+            grid,
         } => {
-            let (mode, frames) = encode(&mode, dial_hz, audio_hz, &message)?;
+            let (mode, frames) =
+                encode(&mode, dial_hz, audio_hz, &message, call.as_deref(), &grid)?;
             let mut queue = jobs.lock().unwrap();
             if STOP.load(Ordering::Relaxed) || queue.len() == MAX_JOBS {
                 let code = if STOP.load(Ordering::Relaxed) {
@@ -236,13 +283,193 @@ pub fn serve(sock: &UnixListener, jobs: &Mutex<VecDeque<Job>>) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use js8rs::{
+        FrameFlags, FrameType,
+        rx::{Decoded, MessageBufferAssembler, ReassemblyEvent},
+    };
+
+    fn txfr(msg: &str, call: Option<&str>, grid: Option<&str>) -> Vec<EncodedFrame> {
+        let mut req = serde_json::json!({
+            "op": "tx", "mode": "n", "dial_hz": 14078000,
+            "audio_hz": 1500, "message": msg,
+        });
+        if let Some(call) = call {
+            req["call"] = call.into();
+        }
+        if let Some(grid) = grid {
+            req["grid"] = grid.into();
+        }
+        let req = serde_json::to_vec(&req).unwrap();
+        let (fd, mut cli) = UnixStream::pair().unwrap();
+        let mut peer = Peer {
+            fd,
+            buf: [0; MAX_REQ],
+            len: req.len(),
+            end: Instant::now() + Duration::from_secs(2),
+        };
+        peer.buf[..req.len()].copy_from_slice(&req);
+        let jobs = Mutex::new(VecDeque::new());
+        submit(&mut peer, req.len(), &jobs).unwrap();
+        let job = jobs.lock().unwrap().pop_front().unwrap();
+        let ack = format!(
+            "{{\"status\":\"queued\",\"frames\":{}}}\n",
+            job.frames.len()
+        );
+        let mut buf = vec![0; ack.len()];
+        cli.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        cli.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, ack.as_bytes());
+        let fr = job.frames;
+        assert!(fr[0].frame.flags.contains(FrameFlags::FIRST));
+        assert!(fr.last().unwrap().frame.flags.contains(FrameFlags::LAST));
+        fr
+    }
+
+    #[test]
+    fn cmds() {
+        for (msg, cmd) in [
+            ("k2xyz snr?", " SNR?"),
+            ("K2XYZ GRID?", " GRID?"),
+            ("K2XYZ INFO?", " INFO?"),
+            ("K2XYZ ACK", " ACK"),
+            ("K2XYZ SNR -12", " SNR"),
+            ("K2XYZ HELLO WORLD", " "),
+        ] {
+            let fr = txfr(msg, Some("k1abc"), None);
+            let hdr = fr[0].decode();
+            assert_eq!(hdr.frame_type, FrameType::FrameDirected);
+            assert_eq!(&hdr.directed[..3], ["K1ABC", "K2XYZ", cmd]);
+            if cmd == " SNR" {
+                assert_eq!(hdr.directed[3], "-12");
+            } else if cmd == " " {
+                let txt: String = fr[1..].iter().map(|f| f.decode().message).collect();
+                assert_eq!(txt, "HELLO WORLD");
+            } else {
+                assert_eq!(fr.len(), 1);
+            }
+            let raw = txfr(msg, None, None);
+            assert!(
+                raw.iter()
+                    .all(|f| f.decode().frame_type == FrameType::FrameData)
+            );
+            assert_eq!(
+                raw.iter().map(|f| f.decode().message).collect::<String>(),
+                msg.to_ascii_uppercase()
+            );
+        }
+    }
+
+    #[test]
+    fn bufs() {
+        let txt = "HELLO THIS IS A LONG MESSAGE THAT NEEDS SEVERAL FRAMES ".repeat(4);
+        for cmd in [" MSG ", " CMD ", " QUERY "] {
+            let fr = txfr(&format!("K2XYZ{cmd}{txt}"), Some("K1ABC"), None);
+            assert!(fr.len() > 2);
+            let mut asm = MessageBufferAssembler::new();
+            let mut done = None;
+            for f in fr {
+                let dec = Decoded::new(f.decode(), 0, -10, 0.0, 1500.0, 1.0);
+                if let Some(ReassemblyEvent::Completed(rsp)) = asm.push_decoded(&dec) {
+                    done = Some(rsp);
+                }
+            }
+            let done = done.expect("buffered cmd did not reassemble");
+            assert_eq!(done.from, "K1ABC");
+            assert_eq!(done.to, "K2XYZ");
+            assert_eq!(done.command.trim(), cmd.trim());
+            assert_eq!(done.payload, txt.trim_end());
+            let crc = done.checksum.unwrap();
+            assert!(crc.valid);
+            assert_eq!(crc.size_bits, 16);
+        }
+    }
+
+    #[test]
+    fn bcns() {
+        for (msg, alt) in [("HB EM73", false), ("CQ CQ CQ EM73", true)] {
+            for mode in ["s", "n", "f", "t", "u"] {
+                let (_, fr) = encode(mode, 14_078_000, 1500.0, msg, Some("K1ABC"), "").unwrap();
+                assert_eq!(fr.len(), 1);
+                let dec = fr[0].decode();
+                assert_eq!(dec.frame_type, FrameType::FrameHeartbeat);
+                assert_eq!(dec.compound, "K1ABC");
+                assert_eq!(dec.extra, "EM73");
+                assert_eq!(dec.is_alt, alt);
+            }
+        }
+        let fr = txfr("`K1ABC EM73", Some("K1ABC"), None);
+        assert_eq!(fr.len(), 1);
+        assert_eq!(fr[0].decode().frame_type, FrameType::FrameCompound);
+        assert_eq!(fr[0].decode().compound, "K1ABC");
+        assert_eq!(fr[0].decode().extra.trim(), "EM73");
+    }
+
+    #[test]
+    fn cmpds() {
+        for (call, to) in [
+            ("F/K1ABC", "K2XYZ"),
+            ("K1ABC", "F/K2XYZ"),
+            ("K1ABC", "@ALLCALL"),
+        ] {
+            let fr = txfr(&format!("{to} SNR?"), Some(call), Some("em73"));
+            assert_eq!(fr.len(), 2);
+            let id = fr[0].decode();
+            assert_eq!(id.frame_type, FrameType::FrameCompound);
+            assert_eq!(id.compound, call);
+            assert_eq!(id.extra.trim(), "EM73");
+            let hdr = fr[1].decode();
+            assert_eq!(hdr.frame_type, FrameType::FrameCompoundDirected);
+            assert_eq!(hdr.directed, ["<....>", to, " SNR?"]);
+        }
+    }
+
+    #[test]
+    fn bad_stn() {
+        for call in [
+            "",
+            " ",
+            "ABC",
+            "123",
+            "@ALLCALL",
+            "K1ABC X",
+            "K1ABC\n",
+            "K1ÉBC",
+            "K123456789",
+            "K1ABC/TEST",
+        ] {
+            assert!(
+                encode("n", 14_078_000, 1500.0, "K2XYZ SNR?", Some(call), "").is_err(),
+                "{call:?}"
+            );
+        }
+        for grid in ["EM7", "EM730", "EM73AA", "ZZ99", "EM7X", " EM73", "EM73\n"] {
+            assert!(
+                encode("n", 14_078_000, 1500.0, "K2XYZ SNR?", Some("K1ABC"), grid).is_err(),
+                "{grid:?}"
+            );
+        }
+        assert!(encode("n", 14_078_000, 1500.0, "HI", None, "EM73").is_err());
+        for msg in [
+            "",
+            "  ",
+            "K1ABC:",
+            "K2XYZ MSG HÉ",
+            "K2XYZ MSG HI\nTX",
+            ":HI",
+        ] {
+            assert!(
+                encode("n", 14_078_000, 1500.0, msg, Some("K1ABC"), "").is_err(),
+                "{msg:?}"
+            );
+        }
+    }
 
     #[test]
     fn requests() {
         for mode in [
             "normal", "n", "fast", "f", "turbo", "t", "slow", "s", "ultra", "u",
         ] {
-            assert!(encode(mode, 14_078_000, 1500.0, "CQ CQ DE N0CALL").is_ok());
+            assert!(encode(mode, 14_078_000, 1500.0, "CQ CQ DE N0CALL", None, "").is_ok());
         }
         for (mode, dial, hz, msg) in [
             ("x", 14_078_000, 1500.0, "HI"),
@@ -258,11 +485,11 @@ mod tests {
             ("n", 14_078_000, 1500.0, ":HI"),
         ] {
             assert!(
-                encode(mode, dial, hz, msg).is_err(),
+                encode(mode, dial, hz, msg, None, "").is_err(),
                 "{mode} {dial} {hz} {msg:?}"
             );
         }
-        assert!(encode("n", 14_078_000, 1500.0, &"X".repeat(1025)).is_err());
+        assert!(encode("n", 14_078_000, 1500.0, &"X".repeat(1025), None, "").is_err());
         for line in [
             "{}",
             "null",

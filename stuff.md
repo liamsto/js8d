@@ -20,9 +20,11 @@ tx:
 {"op":"tx","mode":"normal","dial_hz":14078000,"audio_hz":1500,"message":"CQ CQ DE N0CALL"}
 ```
 
-status:
-
+No call = plaintext, adding call allows packed cmds, directed msgs, cq, hb, and compound frames.
 ```json
-{"status":"queued","frames":2}
-{"status":"ok"}
+{"op":"tx","mode":"normal","dial_hz":14078000,"audio_hz":1500,"call":"N0CALL","message":"K1ABC SNR?"}
+{"op":"tx","mode":"normal","dial_hz":14078000,"audio_hz":1500,"call":"N0CALL","grid":"CN89","message":"K1ABC MSG MEET AT 1800Z"}
 ```
+
+call = local station, grid =  char locator for compound station ids
+max 1024 bytes
