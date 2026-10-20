@@ -28,6 +28,7 @@ enum Req {
         mode: String,
         dial_hz: u64,
         audio_hz: f64,
+        power_w: Option<u16>,
         message: String,
         call: Option<String>,
         #[serde(default)]
@@ -48,6 +49,7 @@ pub struct Job {
     pub mode: Submode,
     pub dial: u64,
     pub hz: f64,
+    pub pwr: Option<u16>,
     pub frames: Vec<EncodedFrame>,
 }
 
@@ -148,10 +150,15 @@ fn submit(peer: &mut Peer, len: usize, jobs: &Mutex<VecDeque<Job>>) -> Res<()> {
             mode,
             dial_hz,
             audio_hz,
+            power_w,
             message,
             call,
             grid,
         } => {
+            let min = if cfg!(feature = "k3") { 0 } else { 1 };
+            if power_w.is_some_and(|w| !(min..=110).contains(&w)) {
+                return Err(format!("power_w outside {min}..110 watts").into());
+            }
             let (mode, frames) =
                 encode(&mode, dial_hz, audio_hz, &message, call.as_deref(), &grid)?;
             let mut queue = jobs.lock().unwrap();
@@ -182,6 +189,7 @@ fn submit(peer: &mut Peer, len: usize, jobs: &Mutex<VecDeque<Job>>) -> Res<()> {
                 mode,
                 dial: dial_hz,
                 hz: audio_hz,
+                pwr: power_w,
                 frames,
             });
             Ok(())
@@ -461,6 +469,46 @@ mod tests {
                 encode("n", 14_078_000, 1500.0, msg, Some("K1ABC"), "").is_err(),
                 "{msg:?}"
             );
+        }
+    }
+
+    #[test]
+    fn pwr_reqs() {
+        use serde_json::json;
+
+        for (w, ok) in [
+            (json!(null), true),
+            (json!(0), cfg!(feature = "k3")),
+            (json!(1), true),
+            (json!(10), true),
+            (json!(110), true),
+            (json!(111), false),
+            (json!(65536), false),
+            (json!(-1), false),
+            (json!(1.5), false),
+            (json!("10"), false),
+            (json!(true), false),
+        ] {
+            let req = serde_json::to_vec(&json!({
+                "op": "tx", "mode": "n", "dial_hz": 14078000,
+                "audio_hz": 1500, "message": "HI", "power_w": w,
+            }))
+            .unwrap();
+            let (fd, _cli) = UnixStream::pair().unwrap();
+            let mut peer = Peer {
+                fd,
+                buf: [0; MAX_REQ],
+                len: req.len(),
+                end: Instant::now() + Duration::from_secs(2),
+            };
+            peer.buf[..req.len()].copy_from_slice(&req);
+            let jobs = Mutex::new(VecDeque::new());
+            assert_eq!(submit(&mut peer, req.len(), &jobs).is_ok(), ok, "{w}");
+            let job = jobs.lock().unwrap().pop_front();
+            assert_eq!(job.is_some(), ok, "{w}");
+            if let Some(job) = job {
+                assert_eq!(job.pwr.map(u64::from), w.as_u64());
+            }
         }
     }
 

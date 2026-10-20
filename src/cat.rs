@@ -198,6 +198,15 @@ impl Cat {
         self.xchg(TX, b"TQ1;")
     }
 
+    pub fn pwr(&mut self, w: u16) -> Res<()> {
+        // G5 p22: K20 uses watts. D5 p25: K41 needs H for watts, L is tenths.
+        #[cfg(feature = "k3")]
+        let pc = format!("PC{w:03};");
+        #[cfg(not(feature = "k3"))]
+        let pc = format!("PC{w:03}H;");
+        self.xchg(&format!("{pc}PC;"), pc.as_bytes())
+    }
+
     pub fn rx(&mut self) -> Res<()> {
         if self.keyed {
             self.xchg(RX, b"TQ0;")?;
@@ -212,5 +221,71 @@ impl Drop for Cat {
         if let Err(e) = self.rx() {
             eprintln!("js8d: RX on close failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::fd::OwnedFd, os::unix::net::UnixStream, thread};
+
+    fn pwrio(w: u16, cmd: &str, rsp: &[u8]) -> Res<()> {
+        let (fd, mut rig) = UnixStream::pair().unwrap();
+        fd.set_nonblocking(true).unwrap();
+        rig.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        let mut cat = Cat {
+            fd: File::from(OwnedFd::from(fd)),
+            keyed: false,
+        };
+        thread::scope(|scope| {
+            let th = scope.spawn(move || {
+                let mut buf = vec![0; cmd.len()];
+                rig.read_exact(&mut buf).unwrap();
+                assert_eq!(buf, cmd.as_bytes());
+                rig.write_all(b"IFstale;").unwrap();
+                for part in rsp.chunks(3) {
+                    rig.write_all(part).unwrap();
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(rig.read(&mut [0]).unwrap(), 0);
+            });
+            let res = cat.pwr(w);
+            drop(cat);
+            th.join().unwrap();
+            res
+        })
+    }
+
+    #[test]
+    fn pwr() {
+        #[cfg(feature = "k3")]
+        let cases = [
+            (0, "PC000;PC;", "PC000;"),
+            (1, "PC001;PC;", "PC001;"),
+            (10, "PC010;PC;", "PC010;"),
+            (110, "PC110;PC;", "PC110;"),
+        ];
+        #[cfg(not(feature = "k3"))]
+        let cases = [
+            (1, "PC001H;PC;", "PC001H;"),
+            (10, "PC010H;PC;", "PC010H;"),
+            (50, "PC050H;PC;", "PC050H;"),
+            (110, "PC110H;PC;", "PC110H;"),
+        ];
+        for (w, cmd, rsp) in cases {
+            pwrio(w, cmd, rsp.as_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn pwr_fail() {
+        #[cfg(feature = "k3")]
+        let (cmd, rsp) = ("PC110;PC;", "PC012;");
+        #[cfg(not(feature = "k3"))]
+        let (cmd, rsp) = ("PC110H;PC;", "PC050H;");
+        let err = pwrio(110, cmd, rsp.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("readback timed out"), "{err}");
+        let err = pwrio(110, cmd, b"?;").unwrap_err().to_string();
+        assert!(err.contains("rejected command"), "{err}");
     }
 }

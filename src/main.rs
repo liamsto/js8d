@@ -194,6 +194,9 @@ fn main() -> Res<()> {
                 let tx = (|| -> Res<()> {
                     ckstop()?;
                     cat.tune(job.dial)?;
+                    if let Some(w) = job.pwr {
+                        cat.pwr(w)?;
+                    }
                     for frame in &job.frames {
                         pcm.prepare()?;
                         let at = slot(job.mode, unix_time_ms(), lead);
