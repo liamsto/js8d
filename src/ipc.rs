@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn bufs() {
         let txt = "HELLO THIS IS A LONG MESSAGE THAT NEEDS SEVERAL FRAMES ".repeat(4);
-        for cmd in [" MSG ", " CMD ", " QUERY "] {
+        for cmd in [" MSG ", " CMD ", " QUERY ", ">"] {
             let fr = txfr(&format!("K2XYZ{cmd}{txt}"), Some("K1ABC"), None);
             assert!(fr.len() > 2);
             let mut asm = MessageBufferAssembler::new();
@@ -414,11 +414,7 @@ mod tests {
 
     #[test]
     fn cmpds() {
-        for (call, to) in [
-            ("F/K1ABC", "K2XYZ"),
-            ("K1ABC", "F/K2XYZ"),
-            ("K1ABC", "@ALLCALL"),
-        ] {
+        for (call, to) in [("F/K1ABC", "K2XYZ"), ("K1ABC", "F/K2XYZ")] {
             let fr = txfr(&format!("{to} SNR?"), Some(call), Some("em73"));
             assert_eq!(fr.len(), 2);
             let id = fr[0].decode();
@@ -429,6 +425,26 @@ mod tests {
             assert_eq!(hdr.frame_type, FrameType::FrameCompoundDirected);
             assert_eq!(hdr.directed, ["<....>", to, " SNR?"]);
         }
+    }
+
+    #[test]
+    fn grps() {
+        for to in ["@ALLCALL", "@APRSIS", "@JS8NET", "@DX/NA"] {
+            let fr = txfr(&format!("{to} SNR?"), Some("K1ABC"), None);
+            assert_eq!(fr.len(), 1);
+            assert_eq!(fr[0].decode().directed, ["K1ABC", to, " SNR?"]);
+        }
+    }
+
+    #[test]
+    fn cmpd_no_grid() {
+        let fr = txfr("K2XYZ SNR?", Some("F/K1ABC"), None);
+        assert_eq!(fr.len(), 2);
+        let id = fr[0].decode();
+        assert_eq!(id.frame_type, FrameType::FrameCompound);
+        assert_eq!(id.compound, "F/K1ABC");
+        assert!(id.directed.is_empty());
+        assert_eq!(fr[1].decode().directed, ["<....>", "K2XYZ", " SNR?"]);
     }
 
     #[test]

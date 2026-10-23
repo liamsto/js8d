@@ -82,8 +82,8 @@ dependencies = [
 
 [[package]]
 name = "js8rs"
-version = "0.4.0"
-source = "git+https://github.com/liamsto/js8rs#5e0f013ff5626bf8320d704ca4adadb205c44a20"
+version = "0.4.1"
+source = "git+https://github.com/liamsto/js8rs#3a5ab0c3718bd0c469d581be2d95351e315c60f4"
 dependencies = [
  "crc",
  "libm",
